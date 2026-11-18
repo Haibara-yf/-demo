@@ -1,0 +1,265 @@
+#pragma kernel Main
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+// 一根草叶的全部参数，compute 写完由 vertex shader 展开成三角形
+struct GrassBlade
+{
+    float3 position;
+    float rotAngle;
+    float hash;
+    float height;
+    float width;
+    float tilt;
+    float bend;
+    float3 surfaceNorm;
+    float windForce;
+    float sideBend;
+    float colorSeed;
+};
+
+// 一簇草的公共参数，从 C# 的 List<ClumpParameters> 上传
+struct ClumpParameters
+{
+    float pullToCenter;
+    float alignToCrowd;
+    float heightBase;
+    float heightRange;
+    float widthBase;
+    float widthRange;
+    float tiltBase;
+    float tiltRange;
+    float bendBase;
+    float bendRange;
+};
+
+StructuredBuffer<ClumpParameters> _ClumpParameters;
+
+AppendStructuredBuffer<GrassBlade> _GrassBlades;
+
+uint _Resolution;
+float _GrassSpacing;
+float2 _GrassOrigin;
+float _JitterStrength;
+float _HeightJitter;
+float _WidthJitter;
+float _ColorJitter;
+
+float3 _PresserPos;
+float _PressRadius;
+float _DisturbStrength;
+float _DisturbSpeed;
+
+Texture2D<float4> _HeightMap;
+Texture2D<float4> _DetailMap;
+SamplerState LinearClampSampler;
+
+Texture2D<float4> ClumpTex;
+SamplerState samplerClumpTex;
+
+float3 _TerrainPosition;
+float _HeightMapScale;
+float _HeightMapMultiplier;
+
+float3 _WSpaceCameraPos;
+float _DistanceCullStartDist;
+float _DistanceCullEndDist;
+float _DistanceCullMinimumGrassAmount;
+
+float4x4 _VP_MATRIX;
+float _FrustumCullNearOffset;
+float _FrustumCullEdgeOffset;
+
+float _ClumpScale;
+
+Texture2D<float4> _LocalWindTex;
+SamplerState LinearRepeatSampler;
+float _LocalWindScale;
+float _LocalWindSpeed;
+float _LocalWindStrength;
+float _LocalWindRotateAmount;
+float _Time;
+
+// 二维哈希：同一个格子永远得到同一个随机值
+float2 Hash2D(float2 p)
+{
+    float t = dot(p, float2(12.9898, 78.233));
+    float2 q = float2(t, t * 1.61803398875);
+    return frac(sin(q) * 43758.5453);
+}
+
+// 三维哈希，用来给草叶做各种随机偏移
+float Random01(float3 vec)
+{
+    return frac(sin(dot(vec.xyz, float3(12.9898, 78.233, 53.539))) * 43758.5453);
+}
+
+// 0~1 映射到 -1~1，方便做「上下浮动」
+float Bipolar(float t)
+{
+    return (t * 2) - 1;
+}
+
+// 从地形高度图取高度，乘上地形自身高度
+float SampleTerrainHeight(float2 normPos)
+{
+    float height = UnpackHeightmap(_HeightMap.SampleLevel(LinearClampSampler, normPos, 0));
+    return height * _HeightMapMultiplier * 2;
+}
+
+// 采样地形的层权重，密度太低的地方直接不长草
+float SampleDensity(float2 normPos)
+{
+    float value = _DetailMap.SampleLevel(LinearClampSampler, normPos, 0).r;
+    return value;
+}
+
+// 把草叶贴到地形表面（法线扰动也靠它算）
+float3 SnapToTerrain(float3 position)
+{
+    float2 normPos = (position.xz - _TerrainPosition.xz) / _HeightMapScale;
+    return float3(position.x, _TerrainPosition.y + SampleTerrainHeight(normPos), position.z);
+}
+
+// 距离剔除：远处按概率丢草，不是一刀切，视觉上更平滑
+uint IsDistanceCulled(float3 worldPos, float hash)
+{
+    float d = distance(worldPos, _WSpaceCameraPos);
+    float keepRatio = 1 - smoothstep(_DistanceCullStartDist, _DistanceCullEndDist, d);
+    keepRatio = (keepRatio * (1 - _DistanceCullMinimumGrassAmount)) + _DistanceCullMinimumGrassAmount;
+    return hash > 1 - keepRatio ? 1 : 0;
+}
+
+// 视锥剔除：直接把点变换到裁剪空间比边界
+uint IsFrustumCulled(float3 worldPos)
+{
+    float4 clip = mul(_VP_MATRIX, float4(worldPos, 1));
+
+    return (clip.z > clip.w
+        || clip.z < 0
+        || clip.x < -clip.w + _FrustumCullEdgeOffset
+        || clip.x > clip.w - _FrustumCullEdgeOffset
+        || clip.y < -clip.w + _FrustumCullNearOffset
+        || clip.y > clip.w)
+            ? 0 : 1;
+}
+
+[numthreads(8, 8, 1)]
+// 每个线程负责一根草：位置 → 分簇 → 贴地 → 剔除 → 姿态 → 颜色 → 扰动 → 写入
+void Main(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _Resolution && id.y < _Resolution)
+    {
+        //1网格坐标 → 世界坐标，整个草区跟着相机走
+        float3 position = float3(id.x, 0, id.y) * _GrassSpacing;
+        position.xz += _GrassOrigin;
+
+        float2 cell = float2(id.xy) + floor(_GrassOrigin / _GrassSpacing);
+        float3 cellId = float3(cell, 0.0);
+
+        float2 hash = Hash2D(cellId.xy);
+        float2 jitterOffset = ((hash * 2) - 1) * _JitterStrength;
+        position.xz += jitterOffset;
+
+        //2采样分簇图：决定这棵草属于哪一簇、朝向哪边
+        float2 clumpCoord = position.xz * float2(_ClumpScale.xx);
+        float3 clumpSample = ClumpTex.SampleLevel(samplerClumpTex, clumpCoord, 0).xyz;
+
+        float clumpIndex = clumpSample.x;
+        ClumpParameters clumpParams = _ClumpParameters[int((clumpIndex))];
+
+        float2 clumpCenter = (clumpSample.yz + floor(clumpCoord)) / float2(_ClumpScale.xx);
+        position.xz = lerp(position.xz, clumpCenter, clumpParams.pullToCenter);
+
+        float2 normPos = (position.xz - _TerrainPosition.xz) / _HeightMapScale;
+        //3贴地：地形没有草层的地方直接 return，不写入 buffer
+        if (SampleDensity(normPos) < 0.1) return;
+
+        position.y = _TerrainPosition.y + SampleTerrainHeight(normPos);
+
+        uint distCulled = IsDistanceCulled(position, hash.x);
+
+        uint frustumInside = IsFrustumCulled(position);
+
+        //4两道剔除都过了才生成草叶
+        if (distCulled == 1 && frustumInside == 1)
+        {
+            GrassBlade bladeData;
+            bladeData.position = position;
+
+            float2 clumpRand = Hash2D(clumpCenter);
+            float2 clumpFacing = normalize(tan((clumpRand + float2(0.13, 1.111)) * 2 - 1));
+            float2 facing = normalize(Hash2D(cellId.xy) * 2 - 1);
+            facing = normalize(lerp(facing, clumpFacing, clumpParams.alignToCrowd));
+            float facingAngle = atan2(facing.y, facing.x);
+
+            float2 worldXZ = position.xz;
+            //5风：噪声贴图决定风向，噪声值同时驱动弯曲
+            float2 windUV = worldXZ * _LocalWindScale;
+
+            windUV += _Time * float2(1, 0.7) * _LocalWindSpeed;
+
+            float windValue = _LocalWindTex.SampleLevel(LinearRepeatSampler, windUV, 0).r;
+
+            float windTheta = ((windValue * 2) - 1) * 3.14159;
+            float2 windDir = float2(cos(windTheta), sin(windTheta));
+            float2 sideVec = normalize(float2(-facing.y, facing.x));
+            float sideDotWind = dot(sideVec, windDir);
+            float windAngle = sideDotWind * (3.14159 / 2) * _LocalWindRotateAmount;
+            facingAngle += windAngle;
+
+            bladeData.rotAngle = facingAngle;
+            bladeData.hash = Random01(cellId.xyx);
+
+            float clumpColor = Hash2D(clumpCenter).y;
+            float bladeColor = Random01(cellId.xyx * float3(3.17, 5.71, 9.23) + 7.3);
+            bladeData.colorSeed = saturate(clumpColor + (bladeColor - 0.5) * _ColorJitter);
+
+            bladeData.height = clumpParams.heightBase + Bipolar(Random01(cellId.xxy)) * clumpParams.heightRange;
+
+            float heightRand = Random01(cellId.xyx * float3(1.73, 2.91, 5.37) + 19.7);
+            bladeData.height += Bipolar(heightRand) * _HeightJitter;
+            bladeData.height = max(bladeData.height, 0.05);
+            bladeData.width = clumpParams.widthBase + Bipolar(Random01(cellId.yxx)) * clumpParams.widthRange;
+
+            float widthRand = Random01(cellId.yyx * float3(2.17, 3.79, 6.31) + 31.3);
+            bladeData.width += Bipolar(widthRand) * _WidthJitter;
+            bladeData.width = max(bladeData.width, 0.001);
+            bladeData.tilt = clumpParams.tiltBase + Bipolar(Random01(cellId.xyx * float3(1.12, 3.3, 17.6))) * clumpParams.tiltRange;
+            bladeData.bend = clumpParams.bendBase + Bipolar(Random01(cellId.xyy * float3(12.32, 0.23, 3.39))) * clumpParams.bendRange;
+
+            bladeData.bend += windValue * _LocalWindStrength;
+
+            //6角色扰动：距离权重 × 两个频率的正弦，相位来自每根草自己的 hash
+            float2 toInteractor = position.xz - _PresserPos.xz;
+            float distToInteractor = length(toInteractor);
+            float falloff = 1.0 - smoothstep(0.0, _PressRadius, distToInteractor);
+            if (falloff > 0.001)
+            {
+                float animPhase = bladeData.hash * 6.2831853;
+                float tt = _Time * _DisturbSpeed + animPhase;
+                float swayAmount = sin(tt) * 0.7 + sin(tt * 2.13 + 1.7) * 0.3;
+                bladeData.bend += swayAmount * falloff * _DisturbStrength;
+                bladeData.tilt += swayAmount * falloff * _DisturbStrength * 0.35;
+            }
+
+            float3 bitangent = float3(1, 0, 0);
+            float3 tangent = float3(0, 0, 1);
+            float3 bitangentSample = SnapToTerrain(position + bitangent * 0.01);
+            float3 tangentSample = SnapToTerrain(position + tangent * 0.01);
+            float3 bitangentDir = (bitangentSample - position).xyz;
+            float3 tangentDir = (tangentSample - position).xyz;
+            float3 normal = normalize(cross(tangentDir, bitangentDir));
+            bladeData.surfaceNorm = normal;
+
+            //7朝向相机的那一侧稍微弯一点，避免侧看时像纸片
+            float3 toCamera = normalize(_WSpaceCameraPos - position);
+            float facingDot = abs(dot(facing, normalize(toCamera.xz)));
+            bladeData.sideBend = smoothstep(0.3, 0, facingDot) * 1.5;
+            bladeData.windForce = windValue * _LocalWindStrength;;
+
+            // 写入 Append buffer，数量由 GPU 自己数
+            _GrassBlades.Append(bladeData);
+        }
+    }
+}
